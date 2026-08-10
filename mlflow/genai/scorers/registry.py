@@ -18,6 +18,8 @@ from mlflow.genai.scorers.base import (
     Scorer,
     ScorerSamplingConfig,
 )
+from mlflow.telemetry.events import GetScorerPresetEvent
+from mlflow.telemetry.track import record_usage_event
 from mlflow.tracking._tracking_service.utils import _get_store
 from mlflow.tracking.fluent import _get_experiment_id
 from mlflow.utils.plugins import get_entry_points
@@ -708,3 +710,56 @@ def delete_scorer(
 
     store = _get_scorer_store()
     return store.delete_scorer(experiment_id, name, version)
+
+
+# =============================================================================
+# Scorer Preset CRUD Functions
+# =============================================================================
+
+
+@record_usage_event(GetScorerPresetEvent)
+def get_scorer_preset(*, name: str, experiment_id: str | None = None, version: str | None = None):
+    """Retrieve a registered scorer preset by name.
+
+    Args:
+        name: The preset name.
+        experiment_id: The experiment ID. If None, uses the active experiment.
+        version: The preset version hash. If None, returns the latest version.
+
+    Returns:
+        ScorerPresetVersion with experiment_id, preset_name, version hash,
+        scorer_refs (list of (scorer_id, scorer_version) tuples), and creation_time.
+    """
+    experiment_id = experiment_id or _get_experiment_id()
+    store = _get_store()
+    return store.get_scorer_preset(experiment_id, name, version)
+
+
+def list_scorer_presets(*, experiment_id: str | None = None):
+    """List all registered scorer presets for an experiment.
+
+    Args:
+        experiment_id: The experiment ID. If None, uses the active experiment.
+
+    Returns:
+        A list of ScorerPresetVersion objects (latest version per preset name).
+    """
+    experiment_id = experiment_id or _get_experiment_id()
+    store = _get_store()
+    presets, _ = store.list_scorer_presets(experiment_id)
+    return presets
+
+
+def delete_scorer_preset(
+    *, name: str, experiment_id: str | None = None, version: str | None = None
+) -> None:
+    """Delete a registered scorer preset.
+
+    Args:
+        name: The preset name.
+        experiment_id: The experiment ID. If None, uses the active experiment.
+        version: The version hash to delete. If None, deletes all versions.
+    """
+    experiment_id = experiment_id or _get_experiment_id()
+    store = _get_store()
+    store.delete_scorer_preset(experiment_id, name, version)
