@@ -35,7 +35,6 @@ import { TracesV4SavedViewsButton, TracesV4SharedViewBanner, useTracesV4SavedVie
 
 interface TracesV4PageContentProps {
   experimentId: string;
-  storageUCSchema: string;
 }
 
 // Below this width the tab stops compressing its controls and scrolls horizontally instead (see the
@@ -49,15 +48,16 @@ const MIN_TAB_CONTENT_WIDTH = 850;
  * providers (ModelTraceExplorer, GenAITracesTable), the drawer, the delete modal, and notifications
  * stay MLflow-side.
  */
-export const TracesV4PageContent = ({ experimentId, storageUCSchema }: TracesV4PageContentProps) => {
+export const TracesV4PageContent = ({ experimentId }: TracesV4PageContentProps) => {
   const { theme } = useDesignSystemTheme();
   const intl = useIntl();
   const { notify, notificationContainer } = useTracesV4Notifications();
   const searchInputRef = useRef<InputRef>(null);
   useSlashFocusSearch(searchInputRef);
 
-  const controller = useTracesV4Controller({ experimentId, storageUCSchema });
-  const { url, page, columns, assessments, columnSizing, bulk, searchInput, filterModel, flags } = controller;
+  const controller = useTracesV4Controller({ experimentId });
+  const { url, page, columns, assessments, columnSizing, traceCount, bulk, searchInput, filterModel, flags } =
+    controller;
 
   // Saved views (URL-first): the hook reads/writes view tags and drives the `cols`+share-key preview
   // overlay. While a shared view is applied, its previewed columns render INSTEAD of the user's own
@@ -94,7 +94,7 @@ export const TracesV4PageContent = ({ experimentId, storageUCSchema }: TracesV4P
     assessments.reset();
   }, [columns, assessments]);
 
-  const actions = useTracesV4TraceActions(experimentId);
+  const actions = useTracesV4TraceActions(experimentId, page.traces, page.refetch);
 
   // The selection stores the full `ModelTraceInfoV3` per trace (keyed by id), so this is the entire
   // cross-page selection — every bulk action (judges, Genie, add-to-dataset, labeling, review queue)
@@ -320,6 +320,10 @@ export const TracesV4PageContent = ({ experimentId, storageUCSchema }: TracesV4P
               onPageSizeChange={url.setPageSize}
               hasNext={page.hasNext}
               hasPrev={page.hasPrev}
+              // "{n} of {total}" footer count (bottom-left).
+              traceCount={traceCount.currentCount}
+              traceTotal={traceCount.totalCount}
+              isTraceCountLoading={traceCount.isTotalLoading}
               // Reserve the pinned pagination bar's height with the floating-obstruction store so the
               // Assistant FAB rises above it instead of overlapping the prev/next/page-size controls.
               PaginationBarWrapper={AssistantAwareActionBar}
@@ -360,6 +364,7 @@ export const TracesV4PageContent = ({ experimentId, storageUCSchema }: TracesV4P
             />
 
             {actions.runJudges?.RunJudgesModal}
+            {actions.editTags.EditTagsModal}
 
             {isIssueDetectionOpen && (
               <IssueDetectionModal

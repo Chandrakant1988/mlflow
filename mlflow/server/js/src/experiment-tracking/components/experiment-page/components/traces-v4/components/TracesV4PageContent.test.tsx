@@ -31,7 +31,6 @@ jest.mock('@mlflow/mlflow/src/experiment-tracking/hooks/useExperimentQuery', () 
 }));
 
 const EXPERIMENT_ID = 'exp-1';
-const STORAGE_UC_SCHEMA = 'cat.sch';
 const PATH = '/ml/experiments/:experimentId/traces';
 const URL = '/ml/experiments/exp-1/traces';
 
@@ -72,6 +71,9 @@ let state: ServerState;
 
 let lastSearch = '';
 
+// Total returned by the trace-metrics endpoint for the footer "{n} of {total}" count.
+let metricsTotalCount = 42;
+
 const LocationSpy = () => {
   const search = useLocation().search;
   useEffect(() => {
@@ -90,7 +92,7 @@ const renderPage = ({ initialUrl = URL }: { initialUrl?: string } = {}) => {
         element: (
           <>
             <LocationSpy />
-            <TracesV4PageContent experimentId={EXPERIMENT_ID} storageUCSchema={STORAGE_UC_SCHEMA} />
+            <TracesV4PageContent experimentId={EXPERIMENT_ID} />
           </>
         ),
       },
@@ -125,6 +127,10 @@ const server = setupServer(
   // The add-to-dataset provider (GenAITracesTableProvider / ExportTracesToDatasetModal) fetches the
   // datasets list on mount; stub it so an unhandled request doesn't disrupt the toolbar render.
   rest.post('/ajax-api/3.0/mlflow/datasets/search', (_req, res, ctx) => res(ctx.json({ datasets: [] }))),
+  // The footer "{n} of {total}" count reads the total from the trace-metrics endpoint.
+  rest.post('/ajax-api/3.0/mlflow/traces/metrics', (_req, res, ctx) =>
+    res(ctx.json({ data_points: [{ metric_name: 'trace_count', values: { COUNT: metricsTotalCount } }] })),
+  ),
 );
 
 const { history } = setupTestRouter();
@@ -139,6 +145,7 @@ beforeEach(() => {
   // default when unseen), which sets `aria-hidden` on the rest of the page and hides the trace rows
   // from queries — the same returning-user state real sessions land in after the first dismissal.
   window.localStorage.setItem('mlflow.detectIssues.guidanceShown_v1', 'true');
+  metricsTotalCount = 42;
   state = {
     pages: { '': { traces: makeTraces(3), next_page_token: undefined } },
     searchCalls: [],
@@ -248,11 +255,8 @@ describe('TracesV4PageContent', () => {
     expect(screen.getByRole('columnheader', { name: 'State' })).toBeInTheDocument();
   });
 
-  // TODO(traces-v4): OSS enables Delete (no UC gate) AND the row-select checkbox → Actions-button flow doesn't register under jsdom (portalled DuBois checkbox). Needs a jsdom-friendly selection interaction + OSS-correct (delete-enabled) assertions.
-
-  test.skip('select rows → Actions → Delete is disabled for UC-backed traces and does not delete', async () => {
+  test('select rows → Actions (2) → Delete is enabled in OSS and opens the confirm modal', async () => {
     const user = userEvent.setup({ pointerEventsCheck: PointerEventsCheckLevel.Never });
-    const deleteSpy = jest.spyOn(MlflowService, 'deleteTracesV3').mockResolvedValue({ traces_deleted: 2 } as never);
     renderPage();
     await findTraceRow('tr-000');
 
@@ -264,15 +268,13 @@ describe('TracesV4PageContent', () => {
     expect(actionsButton).toHaveTextContent('Actions (2)');
     await user.click(actionsButton);
 
-    // Every v4 trace is UC-backed, so Delete is disabled with a tooltip; clicking it is a no-op.
-    // (The disabled item appends an info-icon tooltip, so match the label by regex.)
+    // OSS traces have no UC gate (isDeleteDisabled === false), so Delete is enabled and clicking it
+    // opens the delete-confirmation modal (mirrors the datasets-v2 delete flow).
     const deleteItem = await screen.findByRole('menuitem', { name: /Delete/ });
-    expect(deleteItem).toHaveAttribute('aria-disabled', 'true');
+    expect(deleteItem).not.toHaveAttribute('aria-disabled', 'true');
     await user.click(deleteItem);
-    // No confirm modal opens and the mutation never fires.
-    expect(screen.queryByRole('button', { name: /^Delete$/ })).not.toBeInTheDocument();
-    expect(deleteSpy).not.toHaveBeenCalled();
-  });
+    expect(await screen.findByRole('dialog')).toHaveTextContent(/Delete/);
+  }, 20000);
 
   test('searching commits only on Enter, not per keystroke, then sends an ILIKE filter', async () => {
     const user = userEvent.setup({ pointerEventsCheck: PointerEventsCheckLevel.Never });
@@ -536,7 +538,9 @@ describe('TracesV4PageContent', () => {
       // First tag is shown as a pill; the second is collapsed into "+1".
       expect(screen.getByText('env: prod')).toBeInTheDocument();
       expect(screen.getByText('+1')).toBeInTheDocument();
-    });
+      // Heavy full-page render is slow under parallel jsdom load; per-test timeout avoids the
+      // lint-forbidden global jest.setTimeout.
+    }, 20000);
 
     test('hides internal mlflow.* tags from the preview', async () => {
       // Only an internal tag → nothing user-facing → renders the "-" empty value.
@@ -683,7 +687,9 @@ describe('TracesV4PageContent', () => {
 
       expect(screen.getByRole('button', { name: 'Next page' })).toBeDisabled();
       expect(screen.getByRole('button', { name: 'Previous page' })).toBeDisabled();
-    });
+      // Heavy full-page render is slow under parallel jsdom load; per-test timeout avoids the
+      // lint-forbidden global jest.setTimeout (matches the sibling pagination tests).
+    }, 20000);
 
     test('an exactly-full last page → Next enabled; clicking it shows "No more results" with the bar still present', async () => {
       const user = userEvent.setup({ pointerEventsCheck: PointerEventsCheckLevel.Never });
@@ -714,15 +720,25 @@ describe('TracesV4PageContent', () => {
       // Full-page renders + two paginations are slow under parallel jsdom load; per-test timeout
       // avoids the lint-forbidden global jest.setTimeout.
     }, 20000);
+
+    test('shows the "{n} of {total}" count — current page rows out of the metrics total', async () => {
+      // 3 rows on the page; the trace-metrics endpoint reports 42 total.
+      state.pages = { '': { traces: makeTraces(3), next_page_token: undefined } };
+      metricsTotalCount = 42;
+      renderPage();
+      await findTraceRow('tr-000');
+
+      expect(await screen.findByText('3 of 42')).toBeInTheDocument();
+    }, 20000);
   });
 
   describe('OSS data path', () => {
-    test('OSS always uses MLFLOW_EXPERIMENT location regardless of storageUCSchema parameter', async () => {
-      renderPage(); // renderPage uses STORAGE_UC_SCHEMA = 'cat.sch', but OSS ignores it
+    test('OSS searches the MLFLOW_EXPERIMENT location', async () => {
+      renderPage();
       await findTraceRow('tr-000');
 
       const location = state.searchCalls[0]?.locations?.[0];
-      // OSS always uses MLFLOW_EXPERIMENT; the storageUCSchema parameter is for Databricks only
+      // OSS always searches by experiment id; UC-schema locations are a Databricks-only concept.
       expect(location?.type).toBe('MLFLOW_EXPERIMENT');
       expect(location?.mlflow_experiment).toEqual({ experiment_id: EXPERIMENT_ID });
     });
@@ -992,9 +1008,7 @@ describe('TracesV4PageContent', () => {
       return screen.findByRole('menu');
     };
 
-    // TODO(traces-v4): Row-select checkbox → Actions button doesn't surface under jsdom (portalled DuBois selection). Product wiring verified; needs jsdom-friendly selection interaction.
-
-    test.skip('always offers "Run scorers" and "Add to evaluation dataset" for a selection', async () => {
+    test('always offers "Run scorers" and "Add to evaluation dataset" for a selection', async () => {
       const user = userEvent.setup({ pointerEventsCheck: PointerEventsCheckLevel.Never });
       renderPage();
       const menu = await openActionsMenuForFirstTrace(user);
@@ -1002,46 +1016,46 @@ describe('TracesV4PageContent', () => {
       // These two are always available (no extra feature gate) — the core evaluation actions.
       expect(within(menu).getByRole('menuitem', { name: 'Run scorers' })).toBeInTheDocument();
       expect(within(menu).getByRole('menuitem', { name: 'Add to evaluation dataset' })).toBeInTheDocument();
-      // Delete remains, below the evaluation group (disabled for UC-backed traces).
-      expect(within(menu).getByRole('menuitem', { name: /Delete/ })).toBeInTheDocument();
-    });
+      // Delete remains, below the evaluation group. In OSS traces have no UC gate, so it's enabled.
+      const deleteItem = within(menu).getByRole('menuitem', { name: /Delete/ });
+      expect(deleteItem).toBeInTheDocument();
+      expect(deleteItem).not.toHaveAttribute('aria-disabled', 'true');
+    }, 20000);
 
-    // TODO(traces-v4): Review queue is Databricks-only and removed from the OSS Actions menu; the assertion is moot AND the selection→Actions flow is jsdom-blocked.
-
-    test.skip('hides the review-queue item (OSS feature)', async () => {
+    test('offers "Flag for review" — review queues ship in OSS, matching v3', async () => {
       const user = userEvent.setup({ pointerEventsCheck: PointerEventsCheckLevel.Never });
       renderPage();
       const menu = await openActionsMenuForFirstTrace(user);
 
-      // Review queues are Databricks-only; "Flag for review" is never shown in OSS.
-      expect(within(menu).queryByRole('menuitem', { name: 'Flag for review' })).not.toBeInTheDocument();
-    });
+      // v3 (TracesV3Logs) wires AddToReviewQueueDropdown with addToReviewQueue: true in OSS, and OSS
+      // ships a full review-queue page/route, so "Flag for review" must be offered in v4 too.
+      expect(within(menu).getByRole('menuitem', { name: 'Flag for review' })).toBeInTheDocument();
+    }, 20000);
 
-    // TODO(traces-v4): Add-to-labeling-session was removed from the OSS Actions menu (Databricks-only). Feature not present in OSS.
-
-    test.skip('offers "Add to labeling session" when review queues are off', async () => {
+    test('offers "Compare" and "Edit tags", gated on the selection size (v3 parity)', async () => {
       const user = userEvent.setup({ pointerEventsCheck: PointerEventsCheckLevel.Never });
       renderPage();
       const menu = await openActionsMenuForFirstTrace(user);
 
-      expect(within(menu).getByRole('menuitem', { name: 'Add to labeling session' })).toBeInTheDocument();
-    });
+      // With one trace selected: Edit tags is actionable, Compare needs 2–3 (both present, matching v3).
+      const editTags = within(menu).getByRole('menuitem', { name: 'Edit tags' });
+      expect(editTags).not.toHaveAttribute('aria-disabled', 'true');
+      const compare = within(menu).getByRole('menuitem', { name: 'Compare' });
+      expect(compare).toHaveAttribute('aria-disabled', 'true');
+    }, 20000);
 
-    // TODO(traces-v4): Row-select → Actions → menuitem flow is jsdom-blocked (portalled selection/dropdown). Product wiring verified.
-
-    test.skip('opening "Run scorers" launches the scorer-selection modal for the selected trace', async () => {
+    test('opening "Run scorers" launches the scorer-selection modal for the selected trace', async () => {
       const user = userEvent.setup({ pointerEventsCheck: PointerEventsCheckLevel.Never });
       renderPage();
       const menu = await openActionsMenuForFirstTrace(user);
       await user.click(within(menu).getByRole('menuitem', { name: 'Run scorers' }));
 
-      // The shared run-scorers modal opens scoped to the single selected trace.
-      expect(await screen.findByRole('dialog', { name: 'Run scorer on trace' })).toBeInTheDocument();
-    });
+      // The shared run-judges modal opens scoped to the single selected trace. (The menu item reads
+      // "Run scorers"; the modal title uses the underlying "judge" terminology.)
+      expect(await screen.findByRole('dialog', { name: /Run judge on trace/ })).toBeInTheDocument();
+    }, 20000); // heavy full-page userEvent render — bump off the flaky 5s default under parallel jsdom load
 
-    // TODO(traces-v4): Cross-page selection depends on the jsdom-blocked checkbox selection flow. Product wiring verified.
-
-    test.skip('bulk actions run on the full cross-page selection (select on page 1, page to 2, Run scorers)', async () => {
+    test('bulk actions run on the full cross-page selection (select on page 1, page to 2, Run scorers)', async () => {
       // The selection now stores each trace's full info keyed by id, so it spans pages. Selecting one
       // trace on page 1, paging to page 2, selecting another there, then running scorers must scope the
       // action to BOTH selected traces — not just the page-2 subset (the reported "Run scorers (2)" runs
@@ -1068,8 +1082,8 @@ describe('TracesV4PageContent', () => {
       await user.click(within(await screen.findByRole('menu')).getByRole('menuitem', { name: 'Run scorers' }));
 
       // The scorer modal launches for the full 2-trace cross-page selection, not the page-2 subset.
-      expect(await screen.findByRole('dialog', { name: 'Run scorer on 2 traces' })).toBeInTheDocument();
-    });
+      expect(await screen.findByRole('dialog', { name: /Run judge on 2 traces/ })).toBeInTheDocument();
+    }, 30000); // heavy: renders two 50-row pages, selects across a page swap, then opens the modal
   });
 
   describe('trace drawer navigation', () => {
@@ -1111,27 +1125,27 @@ describe('TracesV4PageContent', () => {
   });
 
   describe('toolbar order', () => {
-    // Assert the always-present V4 control ordering. Detect Issues renders whenever issue detection
-    // is enabled (true in OSS) and sits just before Refresh; the selection-only Actions button lands
-    // between Columns and Detect Issues.
-    test('renders Date → Search → Filter → Columns → Detect Issues → Views → Refresh', async () => {
+    // Assert the always-present V4 control ordering. Views pins far left (before the date selector);
+    // Detect Issues renders whenever issue detection is enabled (true in OSS) and sits just before
+    // Refresh; the selection-only Actions button lands between Columns and Detect Issues.
+    test('renders Views → Date → Search → Filter → Columns → Detect Issues → Refresh', async () => {
       renderPage();
       await findTraceRow('tr-000');
 
+      const views = screen.getByTestId('trace-v4-saved-views-trigger');
       const date = screen.getByTestId('time-range-select-dropdown');
       const search = screen.getByPlaceholderText('Search traces by id, input, or output');
       const filter = screen.getByRole('button', { name: /Filters/ });
       const columns = screen.getByRole('button', { name: 'Select visible columns' });
       const detectIssues = screen.getByRole('button', { name: 'Detect issues in traces' });
-      const views = screen.getByTestId('trace-v4-saved-views-trigger');
       const refresh = screen.getByRole('button', { name: 'now' });
       // DOCUMENT_POSITION_FOLLOWING (4) means the arg node comes after `this` node in document order.
+      expect(views.compareDocumentPosition(date) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       expect(date.compareDocumentPosition(search) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       expect(search.compareDocumentPosition(filter) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       expect(filter.compareDocumentPosition(columns) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       expect(columns.compareDocumentPosition(detectIssues) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-      expect(detectIssues.compareDocumentPosition(views) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-      expect(views.compareDocumentPosition(refresh) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(detectIssues.compareDocumentPosition(refresh) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       // The full page render (incl. the Detect Issues button's first-visit guidance popover) is slow
       // under parallel jsdom load; per-test timeout avoids the lint-forbidden global jest.setTimeout.
     }, 20000);
@@ -1140,9 +1154,7 @@ describe('TracesV4PageContent', () => {
     // IssueDetectionModal, which fires gateway endpoint + API-key queries this suite's MSW doesn't
     // stub (it hangs). The button→modal wiring mirrors v3's; presence/order is covered above.
 
-    // TODO(traces-v4): The Actions button only renders on selection, which is jsdom-blocked here (portalled DuBois checkbox).
-
-    test.skip('places the selection Actions button between Columns and Refresh', async () => {
+    test('places the selection Actions button between Columns and Refresh', async () => {
       const user = userEvent.setup({ pointerEventsCheck: PointerEventsCheckLevel.Never });
       renderPage();
       await findTraceRow('tr-000');
@@ -1153,6 +1165,6 @@ describe('TracesV4PageContent', () => {
       const refresh = screen.getByRole('button', { name: 'now' });
       expect(columns.compareDocumentPosition(actions) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       expect(actions.compareDocumentPosition(refresh) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    });
+    }, 20000);
   });
 });

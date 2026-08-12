@@ -20,13 +20,13 @@ import { useTracesV4TimeRange } from './useTracesV4TimeRange';
 import { useTracesV4Columns } from './useTracesV4Columns';
 import { useTracesV4AssessmentColumns } from './useTracesV4AssessmentColumns';
 import { useTracesV4ColumnSizing } from './useTracesV4ColumnSizing';
+import { useTracesV4TraceCount } from './useTracesV4TraceCount';
 import { buildFilter, buildOrderBy } from '../utils/buildTracesV4SearchParams';
 import { compileFilterModel, compileTagFilters } from '../utils/filterModel';
 import { SEARCH_DEBOUNCE_MS } from '../utils/constants';
 
 interface UseTracesV4ControllerParams {
   experimentId: string;
-  storageUCSchema: string;
 }
 
 export interface UseTracesV4ControllerResult {
@@ -35,6 +35,8 @@ export interface UseTracesV4ControllerResult {
   columns: ReturnType<typeof useTracesV4Columns>;
   assessments: ReturnType<typeof useTracesV4AssessmentColumns>;
   columnSizing: ReturnType<typeof useTracesV4ColumnSizing>;
+  /** "{n} of {total}" footer count — current page rows out of the experiment total. */
+  traceCount: ReturnType<typeof useTracesV4TraceCount>;
   bulk: ReturnType<typeof useBulkTraceSelection>;
   searchInput: ReturnType<typeof useDebouncedSearchInput>;
   filterModel: TraceFilterModel;
@@ -66,10 +68,7 @@ export interface UseTracesV4ControllerResult {
  * render layer. Compiling the filter model into a server clause string and the warehouse `enabled`
  * check stay MLflow-side; they feed the shared `useTracesPageQuery` via `identity`.
  */
-export const useTracesV4Controller = ({
-  experimentId,
-  storageUCSchema,
-}: UseTracesV4ControllerParams): UseTracesV4ControllerResult => {
+export const useTracesV4Controller = ({ experimentId }: UseTracesV4ControllerParams): UseTracesV4ControllerResult => {
   const url = useTracesV4UrlState();
   const { timeRangeMs: timeRange, setTimeRange } = useTracesV4TimeRange(experimentId);
   const queryClient = useQueryClient();
@@ -91,8 +90,8 @@ export const useTracesV4Controller = ({
   const { submit: submitSearch } = searchInput;
 
   // OSS traces live under an MLflow experiment (the `SearchTracesV3` handler reads only
-  // `location.mlflow_experiment.experiment_id` and ignores UC-schema locations). The Databricks
-  // build searches a UC schema derived from `storageUCSchema`; here we search the experiment.
+  // `location.mlflow_experiment.experiment_id` and ignores UC-schema locations), so we always
+  // search the experiment location. The Databricks build instead searches a UC schema.
   const locations = useMemo<ModelTraceSearchLocation[]>(
     () => [{ type: 'MLFLOW_EXPERIMENT', mlflow_experiment: { experiment_id: experimentId } }],
     [experimentId],
@@ -178,6 +177,7 @@ export const useTracesV4Controller = ({
   const columns = useTracesV4Columns(experimentId, { hasSessionOnPage });
   const assessments = useTracesV4AssessmentColumns(experimentId, page.traces);
   const columnSizing = useTracesV4ColumnSizing(experimentId);
+  const traceCount = useTracesV4TraceCount(experimentId, page.traces.length, timeRange);
 
   const bulk = useBulkTraceSelection(page.traces);
 
@@ -210,6 +210,7 @@ export const useTracesV4Controller = ({
     columns,
     assessments,
     columnSizing,
+    traceCount,
     bulk,
     searchInput,
     filterModel,
