@@ -35,6 +35,158 @@ def _resolve_file_path(raw_path: str, cwd: Path | None) -> Path:
     return p.resolve()
 
 
+# Command paths (the resolved chain of subcommand names, e.g. ("artifacts", "download"))
+# that are safe to run unprompted with no configured project directory: they only ever
+# read already-tracked MLflow metadata and can't reach an arbitrary local path.
+_MLFLOW_READ_ONLY_COMMAND_PATHS = {
+    (),  # root-only calls, e.g. "mlflow --version" / "mlflow --help"
+    ("experiments", "search"),
+    ("experiments", "get"),
+    ("runs", "list"),
+    ("runs", "describe"),
+    ("traces", "search"),
+    ("traces", "get"),
+    ("datasets", "list"),
+    ("artifacts", "list"),
+}
+
+# Command paths that read or write a local filesystem path outside any run/experiment
+# concept, so mlflow does not confine them to a workspace on its own. Each maps to the
+# resolved Click parameter name(s) holding that local path.
+_MLFLOW_ARTIFACT_FILE_PARAMS = {
+    ("artifacts", "download"): ("dst_path", "--dst-path"),
+    ("artifacts", "log-artifact"): ("local_file", "--local-file"),
+    ("artifacts", "log-artifacts"): ("local_dir", "--local-dir"),
+}
+
+
+def _is_local_artifact_uri(uri: str) -> bool:
+    # mlflow's artifact repository registry maps an empty scheme, and the "file" scheme,
+    # to a LocalArtifactRepository rooted at the raw path -- unlike runs:/, models:/,
+    # s3://, etc., which go through real tracked/remote storage. A single-letter scheme
+    # is a Windows drive letter (e.g. "C:\\...") misparsed by urlparse, also local.
+    from urllib.parse import urlparse
+
+    scheme = urlparse(uri).scheme.lower()
+    return scheme in ("", "file") or len(scheme) == 1
+
+
+# Root-level mlflow options with no side effect: safe regardless of which (if any)
+# subcommand follows. Any other root option is either handled explicitly below
+# (--env-file) or, if unrecognized, denied by default rather than silently ignored.
+# Click adds an implicit "--help" on every group, parsed under the key "help".
+_MLFLOW_HARMLESS_ROOT_OPTIONS = {"version", "help"}
+
+
+def _resolve_mlflow_command(
+    argv: list[str],
+) -> tuple[tuple[str, ...], dict[str, Any], dict[str, Any]] | None:
+    """Resolve which mlflow subcommand chain and options ``argv`` (excluding "mlflow"
+    itself) would actually invoke, using mlflow's own Click command tree -- the same
+    parser mlflow itself uses -- rather than a hand-rolled reimplementation of it, so
+    root options (e.g. ``--env-file``), repeated flags, and attached short options are
+    all resolved exactly as they would be at runtime. Returns (path, params, root_opts):
+    path is empty for a root-only call (e.g. --version/--help); root_opts holds
+    whatever root-level options (e.g. --env-file) were parsed, independent of path,
+    since those can have effects regardless of which subcommand follows. None if
+    resolution fails.
+    """
+    import click
+
+    from mlflow.cli import cli as mlflow_cli
+
+    try:
+        path: list[str] = []
+        cmd: click.BaseCommand = mlflow_cli
+        ctx = click.Context(mlflow_cli, info_name="mlflow", resilient_parsing=True)
+        remaining = argv
+        root_opts: dict[str, Any] = {}
+        root_parsed = False
+        while isinstance(cmd, click.Group):
+            parser = cmd.make_parser(ctx)
+            opts, args, _ = parser.parse_args(args=remaining)
+            if not root_parsed:
+                root_opts = opts
+                root_parsed = True
+            if not args:
+                return tuple(path), {}, root_opts
+            name, sub, remaining = cmd.resolve_command(ctx, args)
+            if sub is None:
+                return None
+            path.append(name)
+            cmd = sub
+            ctx = click.Context(sub, info_name=name, parent=ctx, resilient_parsing=True)
+        parser = cmd.make_parser(ctx)
+        opts, _, _ = parser.parse_args(args=remaining)
+        return tuple(path), opts, root_opts
+    except Exception:
+        _logger.exception("Failed to resolve mlflow command for permission check")
+        return None
+
+
+def _require_workspace_path(path_value: str, cwd: Path, flag: str) -> str | None:
+    try:
+        target = _resolve_file_path(path_value, cwd)
+    except (ValueError, OSError, TypeError):
+        return f"Permission denied: malformed path {path_value!r}"
+    if not _is_path_within(target, cwd):
+        return f"Permission denied: {flag} {path_value} is outside the workspace {cwd}"
+    return None
+
+
+def _mlflow_command_denial(argv: list[str], cwd: Path | None) -> str | None:
+    """Allowlist mlflow CLI commands that are safe to run unprompted: everything else is
+    denied by default rather than trying to enumerate every dangerous mlflow subcommand
+    (mlflow has dozens across projects, models, deployments, db, server, ...).
+    """
+    resolved = _resolve_mlflow_command(argv[1:])
+    if resolved is None:
+        return "Permission denied: could not validate this mlflow command"
+    path, params, root_opts = resolved
+
+    # "--env-file" is an eager root option: it loads a dotenv file's content as
+    # environment variables before any subcommand even runs, regardless of which (if
+    # any) subcommand follows, so it needs the same containment as any other
+    # local-path argument, checked before the subcommand allowlist below.
+    env_file = root_opts.get("env_file")
+    if env_file:
+        if cwd is None:
+            return "Permission denied: mlflow --env-file requires a configured project directory"
+        if (denial := _require_workspace_path(env_file, cwd, "--env-file")) is not None:
+            return denial
+    if set(root_opts) - _MLFLOW_HARMLESS_ROOT_OPTIONS - {"env_file"}:
+        # A root option other than the ones explicitly accounted for above: the
+        # command paths below were only audited assuming no other root option is in
+        # play, so don't assume it's safe just because the subcommand looks familiar.
+        return "Permission denied: unrecognized mlflow option"
+
+    if path in _MLFLOW_READ_ONLY_COMMAND_PATHS:
+        return None
+
+    file_param = _MLFLOW_ARTIFACT_FILE_PARAMS.get(path)
+    if file_param is None:
+        return f"Permission denied: mlflow {' '.join(path)} is not allowed outside full access"
+
+    # download/log-artifact/log-artifacts read or write local filesystem paths, so
+    # require the same configured project directory Read/Write/Edit/python do.
+    if cwd is None:
+        return "Permission denied: mlflow artifacts requires a configured project directory"
+
+    if path == ("artifacts", "download"):
+        artifact_uri = params.get("artifact_uri")
+        if artifact_uri and _is_local_artifact_uri(artifact_uri):
+            return "Permission denied: mlflow artifacts download does not allow local artifact URIs"
+
+    param_name, flag = file_param
+    path_value = params.get(param_name)
+    if not path_value:
+        # Left to its default, mlflow downloads to a new directory outside any
+        # workspace concept, so an explicit, contained destination is required rather
+        # than silently allowing whatever mlflow's own default happens to be.
+        return f"Permission denied: {flag} must be set to a path inside the workspace"
+    return _require_workspace_path(path_value, cwd, flag)
+
+
 def static_permission_error(
     tool_name: str,
     tool_input: dict[str, Any],
@@ -63,6 +215,23 @@ def static_permission_error(
                 f"Permission denied: only {', '.join(sorted(_ALLOWED_BASH_COMMANDS))} "
                 "commands are allowed"
             )
+        # python/python3 can run arbitrary code, including reading any file the
+        # process can access, so require the same configured project directory
+        # Read/Write/Edit do below. Without this, GHSA-27c7-qx3r-x4f8's impact
+        # (arbitrary file read when cwd is None) is reachable via
+        # Bash("python3 -c \"print(open(path).read())\"") even though Read
+        # itself is denied.
+        if argv[0] in {"python", "python3"} and cwd is None:
+            return f"Permission denied: {argv[0]} requires a configured project directory"
+
+        # mlflow has dozens of subcommands (projects, models, deployments, db, server,
+        # ...), several of which execute code or touch the local filesystem in ways
+        # that have nothing to do with a configured project directory. Rather than
+        # denylisting the ones known to be dangerous today, only a small allowlist of
+        # audited read-only/contained commands is allowed unprompted; anything else
+        # falls through to the interactive per-call approval prompt.
+        if argv[0] == "mlflow" and (denial := _mlflow_command_denial(argv, cwd)) is not None:
+            return denial
 
     if tool_name in _FILE_TOOLS and not perms.allow_edit_files:
         return f"Permission denied: {tool_name} is not allowed"
@@ -70,9 +239,20 @@ def static_permission_error(
     if tool_name in {"Write", "Edit"} and not cwd:
         return f"Permission denied: {tool_name} requires a configured project directory"
 
-    if tool_name in _FILE_TOOLS and cwd:
+    if tool_name in _FILE_TOOLS:
         if raw_path := tool_input.get("file_path") or tool_input.get("path", ""):
-            target = _resolve_file_path(raw_path, cwd)
+            if cwd is None:
+                return f"Permission denied: {tool_name} requires a configured project directory"
+            try:
+                target = _resolve_file_path(raw_path, cwd)
+            except (ValueError, OSError, TypeError):
+                # e.g. an embedded NUL byte (ValueError/OSError), or a non-string
+                # file_path such as a list or int from malformed tool-call JSON
+                # (TypeError from the Path() constructor itself): Path.resolve()
+                # raises rather than returning a path, so this must be caught here
+                # rather than left to propagate out of execute_tool, which only wraps
+                # the tool dispatch (below) in try/except, not this static check.
+                return f"Permission denied: malformed path {raw_path!r}"
             if not _is_path_within(target, cwd):
                 return f"Permission denied: path {raw_path} is outside the workspace {cwd}"
 
@@ -94,7 +274,9 @@ async def execute_tool(
     try:
         match tool_name:
             case "Bash":
-                return await _execute_bash(tool_input, cwd=cwd, tracking_uri=tracking_uri)
+                return await _execute_bash(
+                    tool_input, cwd=cwd, tracking_uri=tracking_uri, full_access=perms.full_access
+                )
             case "Read":
                 return await asyncio.to_thread(_execute_read, tool_input, cwd=cwd)
             case "Write":
@@ -112,8 +294,12 @@ async def _execute_bash(
     tool_input: dict[str, Any],
     cwd: Path | None,
     tracking_uri: str | None,
+    full_access: bool = False,
 ) -> tuple[str, bool]:
-    command = tool_input.get("command", "")
+    # Stripped the same way static_permission_error strips before its own shlex.split, so
+    # the two can't tokenize argv[0] differently (e.g. a leading non-ASCII whitespace
+    # character that str.strip() removes but shlex's default whitespace set does not).
+    command = tool_input.get("command", "").strip()
     if not command:
         return "No command provided", True
 
@@ -122,14 +308,36 @@ async def _execute_bash(
         env["MLFLOW_TRACKING_URI"] = tracking_uri
 
     try:
-        # Shell required: LLM-generated commands may use pipes, redirects, or && chaining.
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-            env=env,
-        )
+        if full_access:
+            # Shell required: LLM-generated commands may use pipes, redirects, or && chaining.
+            # Safe here because full access has no allowlist to bypass in the first place.
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+            )
+        else:
+            # Restricted mode: static_permission_error only validates argv[0] against the
+            # allowlist. Running the raw string through a shell would let shell operators
+            # after argv[0] (&&, ;, |, `` `` , $()) smuggle in commands the allowlist never
+            # saw, e.g. "mlflow --help && python3 -c '...'" passes the argv[0] check but a
+            # shell would still execute the chained python3 call. Executing the
+            # already-validated argv directly, with no shell, means anything after argv[0]
+            # is passed as a literal argument to the allowlisted program and never
+            # interpreted as a separate command.
+            try:
+                argv = shlex.split(command)
+            except ValueError:
+                return "Permission denied: malformed command", True
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+            )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
         output = stdout.decode("utf-8", errors="replace")
         err_output = stderr.decode("utf-8", errors="replace")
