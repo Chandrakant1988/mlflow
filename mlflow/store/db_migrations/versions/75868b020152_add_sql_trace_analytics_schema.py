@@ -13,11 +13,9 @@ from decimal import Decimal, InvalidOperation
 
 import sqlalchemy as sa
 from alembic import op
-from sqlalchemy.dialects import mssql
+from sqlalchemy.dialects import mssql, mysql
 
 from mlflow.tracing.constant import (
-    MAX_CHARS_IN_TRACE_INFO_METADATA,
-    MAX_CHARS_IN_TRACE_INFO_TAGS_VALUE,
     CostKey,
     SpanAttributeKey,
     TokenUsageKey,
@@ -35,7 +33,12 @@ _logger = logging.getLogger(__name__)
 _BATCH_SIZE = 250
 _BIGINT_MIN = -(2**63)
 _BIGINT_MAX = 2**63 - 1
+# Analytics column lengths are frozen at this revision. A migration must replay identically
+# forever, so it inlines these values instead of importing them from application code, which is
+# free to change in a later release.
 _MODEL_DIMENSION_MAX_LENGTH = 500
+_TRACE_NAME_MAX_LENGTH = 4096
+_SESSION_ID_MAX_LENGTH = 250
 _TOKEN_COLUMNS = {
     TokenUsageKey.INPUT_TOKENS: "input_tokens",
     TokenUsageKey.OUTPUT_TOKENS: "output_tokens",
@@ -50,6 +53,46 @@ _COST_COLUMNS = {
 }
 
 
+def _analytics_columns_by_table():
+    # Frozen copy of trace_analytics.analytics_columns_by_table() as of this revision. The online
+    # prepopulation utility adds columns from the live helper; this migration adds them from this
+    # frozen copy so it never changes behavior when the live helper evolves. The parity test
+    # test_frozen_migration_columns_match_the_live_helper asserts the two stay aligned until a new
+    # migration intentionally diverges them.
+    return {
+        "trace_info": [
+            sa.Column("trace_name", sa.String(length=_TRACE_NAME_MAX_LENGTH), nullable=True),
+            sa.Column("session_id", sa.String(length=_SESSION_ID_MAX_LENGTH), nullable=True),
+            sa.Column("input_tokens", sa.BigInteger(), nullable=True),
+            sa.Column("output_tokens", sa.BigInteger(), nullable=True),
+            sa.Column("total_tokens", sa.BigInteger(), nullable=True),
+            sa.Column("cache_read_input_tokens", sa.BigInteger(), nullable=True),
+            sa.Column("cache_creation_input_tokens", sa.BigInteger(), nullable=True),
+            sa.Column("input_cost", sa.Float(precision=53), nullable=True),
+            sa.Column("output_cost", sa.Float(precision=53), nullable=True),
+            sa.Column("total_cost", sa.Float(precision=53), nullable=True),
+        ],
+        "assessments": [
+            sa.Column("experiment_id", sa.Integer(), nullable=True),
+            sa.Column("trace_timestamp_ms", sa.BigInteger(), nullable=True),
+            sa.Column("aggregate_value", sa.Float(precision=53), nullable=True),
+            # Added nullable so the online prepopulation utility adds it with a fast metadata-only
+            # ALTER. _finalize_assessment_not_null tightens it to NOT NULL after the backfill fills
+            # every row; the false server default keeps a concurrent insert from leaving a NULL.
+            sa.Column("is_numeric_value", sa.Boolean(), nullable=True, server_default=sa.false()),
+        ],
+        "spans": [
+            sa.Column("input_cost", sa.Float(precision=53), nullable=True),
+            sa.Column("output_cost", sa.Float(precision=53), nullable=True),
+            sa.Column("total_cost", sa.Float(precision=53), nullable=True),
+            sa.Column("model_name", sa.String(length=_MODEL_DIMENSION_MAX_LENGTH), nullable=True),
+            sa.Column(
+                "model_provider", sa.String(length=_MODEL_DIMENSION_MAX_LENGTH), nullable=True
+            ),
+        ],
+    }
+
+
 def upgrade():
     _validate_required_trace_joins()
     _validate_dimension_attributes()
@@ -58,6 +101,7 @@ def upgrade():
     _backfill_span_analytics()
     _backfill_assessment_analytics()
     _validate_backfill()
+    _finalize_assessment_not_null()
     _create_rollup_tables()
     _create_analytics_indexes()
     _cleanup_legacy_analytics()
@@ -137,58 +181,96 @@ def _add_dimension_attributes():
         op.add_column("spans", column)
 
 
-def _add_analytics_columns():
-    trace_columns = [
-        sa.Column(
-            "trace_name",
-            sa.String(length=MAX_CHARS_IN_TRACE_INFO_TAGS_VALUE),
-            nullable=True,
-        ),
-        sa.Column(
-            "session_id",
-            sa.String(length=MAX_CHARS_IN_TRACE_INFO_METADATA),
-            nullable=True,
-        ),
-        sa.Column("input_tokens", sa.BigInteger(), nullable=True),
-        sa.Column("output_tokens", sa.BigInteger(), nullable=True),
-        sa.Column("total_tokens", sa.BigInteger(), nullable=True),
-        sa.Column("cache_read_input_tokens", sa.BigInteger(), nullable=True),
-        sa.Column("cache_creation_input_tokens", sa.BigInteger(), nullable=True),
-        sa.Column("input_cost", sa.Float(precision=53), nullable=True),
-        sa.Column("output_cost", sa.Float(precision=53), nullable=True),
-        sa.Column("total_cost", sa.Float(precision=53), nullable=True),
-    ]
-    assessment_columns = [
-        sa.Column("experiment_id", sa.Integer(), nullable=True),
-        sa.Column("trace_timestamp_ms", sa.BigInteger(), nullable=True),
-        sa.Column("aggregate_value", sa.Float(precision=53), nullable=True),
-        sa.Column("is_numeric_value", sa.Boolean(), nullable=False, server_default=sa.false()),
-    ]
-    span_columns = [
-        sa.Column("input_cost", sa.Float(precision=53), nullable=True),
-        sa.Column("output_cost", sa.Float(precision=53), nullable=True),
-        sa.Column("total_cost", sa.Float(precision=53), nullable=True),
-        sa.Column("model_name", sa.String(length=_MODEL_DIMENSION_MAX_LENGTH), nullable=True),
-        sa.Column("model_provider", sa.String(length=_MODEL_DIMENSION_MAX_LENGTH), nullable=True),
-    ]
+def _type_description(type_, dialect):
+    return str(type_.dialect_impl(dialect).compile(dialect=dialect))
 
-    if op.get_bind().dialect.name == "sqlite":
-        for table_name, columns in (
-            ("trace_info", trace_columns),
-            ("assessments", assessment_columns),
-            ("spans", span_columns),
-        ):
-            with op.batch_alter_table(table_name) as batch_op:
-                for column in columns:
-                    batch_op.add_column(column)
-    else:
-        for table_name, columns in (
-            ("trace_info", trace_columns),
-            ("assessments", assessment_columns),
-            ("spans", span_columns),
-        ):
-            for column in columns:
-                op.add_column(table_name, column)
+
+def _types_are_compatible(expected, actual, dialect):
+    # Frozen copy of trace_analytics.types_are_compatible() as of this revision. See
+    # _validate_existing_column for why the migration must not import the live helper.
+    #
+    # Dispatch on the generic expected type rather than dialect_impl(). Some drivers rewrite a
+    # generic type into a subclass that breaks the isinstance() family checks below: e.g. psycopg
+    # turns sa.Float into _PsycopgFloat, which derives from Numeric (not sa.Float), so a FLOAT(53)
+    # column would be wrongly rejected as incompatible with itself.
+    if isinstance(expected, sa.Text):
+        return isinstance(actual, sa.Text)
+    if isinstance(expected, sa.BigInteger):
+        return isinstance(actual, sa.BigInteger)
+    if isinstance(expected, sa.Integer):
+        return isinstance(actual, sa.Integer) and not isinstance(
+            actual, (sa.BigInteger, sa.SmallInteger)
+        )
+    if isinstance(expected, sa.Float):
+        return isinstance(actual, sa.Float)
+    if isinstance(expected, sa.Boolean):
+        if isinstance(actual, sa.Boolean):
+            return True
+        # MySQL has no native BOOLEAN type: it stores and reflects Boolean columns as TINYINT(1),
+        # so a reflected TINYINT(1) is the expected match on that dialect (e.g. when the online
+        # prepopulation utility added is_numeric_value before this migration validates it).
+        return isinstance(actual, mysql.TINYINT) and getattr(actual, "display_width", None) == 1
+    if isinstance(expected, sa.String):
+        # MySQL maps long String columns to TEXT via with_variant(), so a reflected Text column is
+        # an acceptable match for an expected String on that dialect.
+        if isinstance(actual, sa.Text):
+            return True
+        return isinstance(actual, sa.String) and expected.length == actual.length
+    return type(expected) is type(actual)
+
+
+def _normalized_false_default(default):
+    if default is None:
+        return False
+    normalized = str(default).strip().lower().split("::", maxsplit=1)[0]
+    normalized = normalized.strip("()'\"")
+    return normalized in {"0", "false"}
+
+
+def _validate_existing_column(table_name, expected, actual, dialect):
+    # Frozen copy of trace_analytics._validate_existing_column() (and its helpers above) as of this
+    # revision. The online prepopulation utility adds these columns from the live helper; a version
+    # skew or a hand-altered column could leave them with the wrong type, nullability, or default,
+    # in which case the backfill would write values the schema silently corrupts. Reject that here
+    # rather than depending on live application code, which a later release is free to change. The
+    # parity tests test_frozen_types_are_compatible_matches_the_live_helper and
+    # test_frozen_normalized_false_default_matches_the_live_helper keep the frozen helpers aligned.
+    problems = []
+    if not _types_are_compatible(expected.type, actual["type"], dialect):
+        problems.append(
+            "type "
+            f"{_type_description(actual['type'], dialect)}; expected "
+            f"{_type_description(expected.type, dialect)}"
+        )
+    if expected.nullable != actual["nullable"]:
+        problems.append(f"nullable={actual['nullable']}; expected nullable={expected.nullable}")
+    if expected.server_default is not None and not _normalized_false_default(actual.get("default")):
+        problems.append(
+            f"server default {actual.get('default')!r}; expected a false server default"
+        )
+
+    if problems:
+        raise RuntimeError(
+            f"Cannot apply trace analytics migration: existing column {table_name}.{expected.name} "
+            f"has incompatible schema ({'; '.join(problems)})"
+        )
+
+
+def _add_analytics_columns():
+    # Add the frozen analytics columns that are not already present. The online prepopulation
+    # utility may have added some already, so this is add-if-missing rather than a plain add, and
+    # any already-present column is validated so a skewed or hand-altered column fails the migration
+    # instead of silently corrupting the backfill. Definitions come from the frozen
+    # _analytics_columns_by_table() so this historical migration keeps adding the same columns even
+    # after the live helper changes.
+    bind = op.get_bind()
+    for table_name, columns in _analytics_columns_by_table().items():
+        existing = {column["name"]: column for column in sa.inspect(bind).get_columns(table_name)}
+        for column in columns:
+            if actual := existing.get(column.name):
+                _validate_existing_column(table_name, column, actual, bind.dialect)
+                continue
+            op.add_column(table_name, column)
 
 
 def _drop_analytics_columns():
@@ -453,9 +535,20 @@ def _backfill_trace_analytics():
         )
     )
     truncation_counts = {"trace_name": 0, "session_id": 0}
+    value_columns = [
+        "trace_name",
+        "session_id",
+        *_TOKEN_COLUMNS.values(),
+        *_COST_COLUMNS.values(),
+    ]
     last_request_id = None
     while True:
-        page_stmt = sa.select(trace_info.c.request_id).order_by(trace_info.c.request_id)
+        # Read the destination columns alongside the keys so rows already filled by the online
+        # prepopulation utility can be skipped instead of rewritten under the migration's lock.
+        page_stmt = sa.select(
+            trace_info.c.request_id,
+            *(trace_info.c[column] for column in value_columns),
+        ).order_by(trace_info.c.request_id)
         if last_request_id is not None:
             page_stmt = page_stmt.where(trace_info.c.request_id > last_request_id)
         batch = bind.execute(page_stmt.limit(_BATCH_SIZE)).all()
@@ -463,6 +556,7 @@ def _backfill_trace_analytics():
             break
 
         batch_ids = [row.request_id for row in batch]
+        rows_by_trace_id = {row.request_id: row for row in batch}
         trace_names = dict.fromkeys(batch_ids)
         for row in bind.execute(
             sa.select(trace_tags.c.request_id, trace_tags.c.value).where(
@@ -502,10 +596,10 @@ def _backfill_trace_analytics():
         for trace_id in batch_ids:
             values = metadata_by_trace[trace_id]
             trace_name, trace_name_truncated = _bounded_string_or_none(
-                trace_names[trace_id], MAX_CHARS_IN_TRACE_INFO_TAGS_VALUE
+                trace_names[trace_id], _TRACE_NAME_MAX_LENGTH
             )
             session_id, session_id_truncated = _bounded_string_or_none(
-                values.get(TraceMetadataKey.TRACE_SESSION), MAX_CHARS_IN_TRACE_INFO_METADATA
+                values.get(TraceMetadataKey.TRACE_SESSION), _SESSION_ID_MAX_LENGTH
             )
             truncation_counts["trace_name"] += trace_name_truncated
             truncation_counts["session_id"] += session_id_truncated
@@ -528,8 +622,13 @@ def _backfill_trace_analytics():
                 **tokens,
                 **{column: costs.get(column) for column in _COST_COLUMNS.values()},
             }
-            updates.append(update)
-        _execute_backfill_updates(bind, update_stmt, updates, "trace")
+            if any(
+                rows_by_trace_id[trace_id]._mapping[column] != update[column]
+                for column in value_columns
+            ):
+                updates.append(update)
+        if updates:
+            _execute_backfill_updates(bind, update_stmt, updates, "trace")
         last_request_id = batch_ids[-1]
 
     if sum(truncation_counts.values()):
@@ -537,9 +636,9 @@ def _backfill_trace_analytics():
             "Truncated trace analytics dimensions during backfill: trace_name=%d "
             "(limit %d), session_id=%d (limit %d)",
             truncation_counts["trace_name"],
-            MAX_CHARS_IN_TRACE_INFO_TAGS_VALUE,
+            _TRACE_NAME_MAX_LENGTH,
             truncation_counts["session_id"],
-            MAX_CHARS_IN_TRACE_INFO_METADATA,
+            _SESSION_ID_MAX_LENGTH,
         )
 
 
@@ -564,12 +663,16 @@ def _backfill_span_analytics():
         )
     )
     truncation_counts = {"model_name": 0, "model_provider": 0}
+    value_columns = [*_COST_COLUMNS.values(), "model_name", "model_provider"]
     last_span_key = None
     while True:
+        # Read the destination columns so rows already filled by the online prepopulation utility
+        # can be skipped instead of rewritten under the migration's lock.
         page_stmt = sa.select(
             spans.c.trace_id,
             spans.c.span_id,
             spans.c.dimension_attributes,
+            *(spans.c[column] for column in value_columns),
         ).order_by(spans.c.trace_id, spans.c.span_id)
         if last_span_key is not None:
             last_trace_id, last_span_id = last_span_key
@@ -616,8 +719,10 @@ def _backfill_span_analytics():
                 "model_name": model_name,
                 "model_provider": model_provider,
             }
-            updates.append(update)
-        _execute_backfill_updates(bind, update_stmt, updates, "span")
+            if any(row._mapping[column] != update[column] for column in value_columns):
+                updates.append(update)
+        if updates:
+            _execute_backfill_updates(bind, update_stmt, updates, "span")
         last_span_key = span_keys[-1]
 
     if sum(truncation_counts.values()):
@@ -648,7 +753,15 @@ def _backfill_assessment_analytics():
         )
     )
     last_assessment_id = None
+    value_columns = [
+        "experiment_id",
+        "trace_timestamp_ms",
+        "aggregate_value",
+        "is_numeric_value",
+    ]
     while True:
+        # Read the destination columns so rows already filled by the online prepopulation utility
+        # can be skipped instead of rewritten under the migration's lock.
         page_stmt = (
             sa
             .select(
@@ -656,6 +769,7 @@ def _backfill_assessment_analytics():
                 assessments.c.value,
                 trace_info.c.experiment_id.label("source_experiment_id"),
                 trace_info.c.timestamp_ms.label("source_trace_timestamp_ms"),
+                *(assessments.c[column] for column in value_columns),
             )
             .join(trace_info, trace_info.c.request_id == assessments.c.trace_id)
             .order_by(assessments.c.assessment_id)
@@ -669,15 +783,18 @@ def _backfill_assessment_analytics():
         updates = []
         for row in batch:
             aggregate_value, is_numeric_value = _assessment_aggregate(row.value)
-            updates.append({
+            update = {
                 "assessment_id_param": row.assessment_id,
                 "experiment_id": row.source_experiment_id,
                 "trace_timestamp_ms": row.source_trace_timestamp_ms,
                 "aggregate_value": aggregate_value,
                 "is_numeric_value": is_numeric_value,
-            })
-        _execute_backfill_updates(bind, update_stmt, updates, "assessment")
-        last_assessment_id = updates[-1]["assessment_id_param"]
+            }
+            if any(row._mapping[column] != update[column] for column in value_columns):
+                updates.append(update)
+        if updates:
+            _execute_backfill_updates(bind, update_stmt, updates, "assessment")
+        last_assessment_id = batch[-1].assessment_id
 
 
 def _validate_required_trace_joins():
@@ -710,6 +827,8 @@ def _validate_backfill():
             sa.or_(
                 assessments.c.experiment_id.is_(None),
                 assessments.c.trace_timestamp_ms.is_(None),
+                # Must be non-NULL before _finalize_assessment_not_null tightens it to NOT NULL.
+                assessments.c.is_numeric_value.is_(None),
             )
         )
         .limit(1)
@@ -717,7 +836,30 @@ def _validate_backfill():
     if missing_assessment_id is not None:
         raise RuntimeError(
             "Trace analytics assessment backfill left assessment "
-            f"{missing_assessment_id!r} without trace dimensions"
+            f"{missing_assessment_id!r} without required analytics values"
+        )
+
+
+def _finalize_assessment_not_null():
+    # is_numeric_value is added nullable so the online prepopulation utility can expand the schema
+    # with a fast metadata-only ALTER. Every assessment row is backfilled and _validate_backfill has
+    # confirmed none is NULL, so tighten it to NOT NULL to match the ORM model. This blocking ALTER
+    # runs only here in the offline migration, never in the online prepopulation path.
+    if op.get_bind().dialect.name == "sqlite":
+        with op.batch_alter_table("assessments") as batch_op:
+            batch_op.alter_column(
+                "is_numeric_value",
+                existing_type=sa.Boolean(),
+                nullable=False,
+                existing_server_default=sa.false(),
+            )
+    else:
+        op.alter_column(
+            "assessments",
+            "is_numeric_value",
+            existing_type=sa.Boolean(),
+            nullable=False,
+            existing_server_default=sa.false(),
         )
 
 
@@ -1043,7 +1185,11 @@ def _assessment_aggregate(value_json):
     if isinstance(value, bool):
         return (1.0 if value else 0.0), False
     if isinstance(value, (int, float)):
-        value = float(value)
+        try:
+            value = float(value)
+        except OverflowError:
+            # Too large for a float: not a usable numeric aggregate, so treat it like inf/nan.
+            return None, False
         return (value, True) if math.isfinite(value) else (None, False)
     if isinstance(value, str):
         value = value.strip().lower()
@@ -1069,7 +1215,9 @@ def _finite_float_or_none(value):
         return None
     try:
         value = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # A magnitude too large for a float (e.g. a huge integer in cost metadata) is treated like
+        # inf: non-finite, so it stores as NULL rather than crashing the backfill batch.
         return None
     return value if math.isfinite(value) else None
 
