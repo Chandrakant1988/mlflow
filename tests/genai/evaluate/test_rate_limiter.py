@@ -1,4 +1,7 @@
 import pytest
+from unittest.mock import patch
+
+import mlflow.genai.judges.adapters.rate_limit_retry_adapters  # noqa: F401 — ensure adapters are registered before any @patch
 
 from mlflow.genai.evaluation.harness import (
     AUTO_INITIAL_RPS,
@@ -13,10 +16,12 @@ from mlflow.genai.evaluation.rate_limiter import (
     is_rate_limit_error,
 )
 from mlflow.genai.judges.adapters.litellm_adapter import (
+    RateLimitRetryAdapter,
     _get_litellm_retry_policy,
+    disable_litellm_rate_limit_retries,
     is_litellm_rate_limit_retries_disabled,
 )
-from mlflow.utils.rest_utils import is_429_retry_disabled
+from mlflow.utils.rest_utils import disable_429_retry, is_429_retry_disabled
 
 
 class FakeClock:
@@ -374,12 +379,28 @@ def test_call_with_retry_reports_throttle_and_success():
 
 # ── eval_retry_context tests ──
 
+# Both built-in adapters forced active so tests don't depend on litellm
+# being installed or a Databricks tracking URI being configured.
+_BOTH_ADAPTERS_ACTIVE = [
+    RateLimitRetryAdapter(
+        name="litellm",
+        is_adapter_active=lambda: True,
+        disable_internal_retries=disable_litellm_rate_limit_retries,
+    ),
+    RateLimitRetryAdapter(
+        name="databricks-sdk",
+        is_adapter_active=lambda: True,
+        disable_internal_retries=disable_429_retry,
+    ),
+]
+
 
 def _retry_flags_active():
     """Check that both downstream retry-suppression flags are set."""
     return is_litellm_rate_limit_retries_disabled() and is_429_retry_disabled()
 
 
+@patch("mlflow.genai.judges.adapters.litellm_adapter._RETRY_ADAPTER_REGISTRY", _BOTH_ADAPTERS_ACTIVE)
 def test_eval_retry_context_sets_and_resets():
     assert not _retry_flags_active()
 
@@ -389,6 +410,7 @@ def test_eval_retry_context_sets_and_resets():
     assert not _retry_flags_active()
 
 
+@patch("mlflow.genai.judges.adapters.litellm_adapter._RETRY_ADAPTER_REGISTRY", _BOTH_ADAPTERS_ACTIVE)
 def test_eval_retry_context_nests():
     assert not _retry_flags_active()
 
